@@ -26,7 +26,7 @@ struct Config{
 	float S;            // количество добавляемого красителя
 };
 
-Config config {18.0, 5.65, 0.031, 0.1f, 25, 0.1f, 0.0f, 1, 0.1, 8.31, 1.0f, 5.0f, 1.0f, 2};
+Config config {18.0, 5.65, 0.031, 0.1f, 25, 0.1, 0.1f, 1, 0.1, 8.31, 1.0f, 5.0f, 50, 2};
 
 #include "core.cu"
 
@@ -35,7 +35,7 @@ int main(){
 	srand(time(NULL));
 	sf::RenderWindow window(sf::VideoMode(FIELDWIDTH, FIELDHEIGHT), "");
 	window.setFramerateLimit(60);
-	//window.setMouseCursorVisible(false);
+	window.setMouseCursorVisible(false);
 
 	auto start = std::chrono::system_clock::now();
 	auto end = std::chrono::system_clock::now();
@@ -47,15 +47,26 @@ int main(){
 
 	sf::Vector2i mpos1 = { -1, -1 }, mpos2 = { -1, -1 };
 	mpos2 = sf::Mouse::getPosition(window);
-	//bool isPressed = false;
-	//bool isPaused = false;
+	bool isPressed = false;
+	bool isPaused = false;
 	while (window.isOpen()){
 		end = std::chrono::system_clock::now();
 		std::chrono::duration<float> diff = end - start;
-		window.setTitle("Burning simulator " + std::to_string(int(1.0f / diff.count())) + " fps");
+		window.setTitle("Fluid simulator " + std::to_string(int(1.0f / diff.count())) + " fps");
 		start = end;
 
 		window.clear(sf::Color::White);
+		sf::Event event;
+		while (window.pollEvent(event))
+		{
+			if (event.type == sf::Event::Closed)
+				window.close();
+
+			if (event.type == sf::Event::KeyPressed && event.key.code == sf::Keyboard::Escape)
+			{
+				window.close();
+			}
+		}
 
 		Vec2 Force;
 		Vec2 ForcePoint;
@@ -76,7 +87,7 @@ int main(){
 
 		std::swap(mpos1, mpos2);
 
-		float dt = 0.001;
+		float dt = 0.0001;
 
 		RenderImage(pixelBuffer.data(), dt, Force, ForcePoint, 1);
 

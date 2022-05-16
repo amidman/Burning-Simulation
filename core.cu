@@ -118,11 +118,6 @@ struct Vec2
 	}
 };
 
-struct Particle{
-	Vec2 u;
-	float due;
-};
-
 struct Color3f
 {
 	float R = 0.0f;
@@ -148,15 +143,18 @@ struct Color3f
 	}
 };
 
+static Vec5* EmptyVec5Field;
 
-static Particle* PartFieldOld;
-static Particle* PartFieldNew;
-static float* PressureFieldOld;
-static float* PressureFieldNew;
+static Vec5* devVec5FieldOld;
+static Vec5* devVec5FieldNew;
 
-static Particle* PartFieldHost;
-static float* PressureFieldHost;
-static uint8_t* dueHost;
+static Vec4* EVec4Field;
+static Vec4* FVec4Field;
+static Vec4* UVec4Field;
+
+static uint8_t* ColorField;
+
+static float* dye;
 
 __device__ float calcE(float T, float ro, Config Con){
 	float dV = Con.dx * Con.dx;
@@ -179,238 +177,158 @@ __device__ int takeIndex(int x, int y){
 	return y*FIELDWIDTH + x;
 }
 
-__device__ Particle interp(Vec2 v, Particle* PartField){
-	float x1 = (int)v.x;
-	float y1 = (int)v.y;
-	float x2 = (int)v.x + 1;
-	float y2 = (int)v.y + 1;
-
-	Particle q1, q2, q3, q4;
-
-	#define CLAMP(val, minv, maxv) min(maxv, max(minv, val))
-	#define SET(Q, x, y) Q = PartField[int(CLAMP(y, 0.0f, FIELDHEIGHT - 1.0f)) * FIELDWIDTH + int(CLAMP(x, 0.0f, FIELDWIDTH - 1.0f))]	
-	SET(q1, x1, y1);
-	SET(q2, x1, y2);
-	SET(q3, x2, y1);
-	SET(q4, x2, y2);
-	#undef SET
-	#undef CLAMP
-	float t1 = (x2 - v.x) / (x2 - x1);
-	float t2 = (v.x - x1) / (x2 - x1);
-	Vec2 f1 = q1.u * t1 + q3.u * t2;
-	Vec2 f2 = q2.u * t1 + q4.u * t2;
-
-	float C1 = q2.due * t1 + q4.due * t2;
-	float C2 = q2.due * t1 + q4.due * t2;
-	float t3 = (y2 - v.y) / (y2 - y1);
-	float t4 = (v.y - y1) / (y2 - y1);
-	Particle res;
-	res.u = f1 * t3 + f2 * t4;
-	res.due = C1 * t3 + C2 * t4;
-	return res;
-}
-
-__global__ void advect(Particle* newField, Particle* oldField, float dt, Config Con){
+__global__ void pre_calc_field(Vec5 *fieldOld, Vec5 *fieldNew, Vec4 *E, Vec4 *F, Vec4 *U, Config Con){
 	int x = blockIdx.x * blockDim.x + threadIdx.x+1;
 	int y = blockIdx.y * blockDim.y + threadIdx.y+1;
 	int index = y*FIELDWIDTH + x;
+	float dV = Con.dx*Con.dx;
+	if((x<FIELDHEIGHT) && (y<FIELDHEIGHT)){
+		Vec4 Un;
+		Vec4 En;
+		Vec4 Fn;
 
-	float decay = 1.0f / (1.0f + Con.nu * dt);
-	Vec2 pos = { x * 1.0f, y * 1.0f };
-	Particle& Pold = oldField[index];
+		Vec5 N;
 
-	Particle p = interp(pos - Pold.u * dt, oldField);
-	p.u = p.u * decay;
-	p.due = p.due * decay;
-	newField[index] = p;
-}
+		N.r = fieldOld[index].r;
+		N.u = fieldOld[index].u;
+		N.v = fieldOld[index].v;
+		N.p = fieldOld[index].p;
+		N.T = fieldOld[index].T;
 
+		float dux = (fieldOld[takeIndex(x+1, y)].u - fieldOld[takeIndex(x-1, y)].u) / (2*Con.dx);
+		float dvy = (fieldOld[takeIndex(x, y+1)].v - fieldOld[takeIndex(x, y-1)].v) / (2*Con.dx);
 
-__device__ float JacobiDue(Particle* Field, Vec2 pos, float B, float alpha, float beta){
-	float C = Field[int(pos.y) * FIELDWIDTH + int(pos.x)].due;
-	float xU = C, xD = C, xL = C, xR = C;
-	#define SET(P, x, y) if (x < FIELDWIDTH && x >= 0 && y < FIELDHEIGHT && y >= 0) P = Field[int(y) * FIELDWIDTH + int(x)].due
-	SET(xU, pos.x, pos.y - 1);
-	SET(xD, pos.x, pos.y + 1);
-	SET(xL, pos.x - 1, pos.y);
-	SET(xR, pos.x + 1, pos.y);
-	#undef SET
-	float pressure = (xU + xD + xL + xR + alpha * B) * (1.0f / beta);
-	return pressure;
-}
+		float duy = (fieldOld[takeIndex(x, y+1)].u - fieldOld[takeIndex(x, y-1)].u) / (2*Con.dx);
+		float dvx = (fieldOld[takeIndex(x+1, y)].v - fieldOld[takeIndex(x-1, y)].v) / (2*Con.dx);
 
-__global__ void diffuseDue(Particle* newField, Particle* oldField, float dt, Config Con){
-	int x = blockIdx.x * blockDim.x + threadIdx.x+1;
-	int y = blockIdx.y * blockDim.y + threadIdx.y+1;
-	int index = y*FIELDWIDTH + x;
+		float TauXX = 2/3 * Con.mu * (2 * dux - dvy);
+		float TauYY = 2/3 * Con.mu * (2 * dvy - dux);
+		float TauXY = 2/3 * Con.mu * (2 * duy - dvx);
 
-	Vec2 pos = { x * 1.0f, y * 1.0f };
-	float due = oldField[index].due;
-	float alpha = Con.DiffCoef * Con.DiffCoef / dt;
-	float beta = 4.0f + alpha;
-	newField[index].due = JacobiDue(oldField, pos, due, alpha, beta);
-}
+		float qx = -Con.TempKoef*(fieldOld[takeIndex(x+1, y)].T - fieldOld[takeIndex(x-1, y)].T) / (2*Con.dx);
+		float qy = -Con.TempKoef*(fieldOld[takeIndex(x, y+1)].T - fieldOld[takeIndex(x, y-1)].T) / (2*Con.dx);
 
-__device__ Vec2 JacobiVel(Particle* Field, Vec2 v, Vec2 B, float alpha, float beta){
-	Vec2 vU = B * -1.0f, vD = B * -1.0f, vR = B * -1.0f, vL = B * -1.0f;
-	#define SET(U, x, y) if (x < FIELDWIDTH && x >= 0 && y < FIELDHEIGHT && y >= 0) U = Field[int(y) * FIELDWIDTH + int(x)].u
-	SET(vU, v.x, v.y - 1);
-	SET(vD, v.x, v.y + 1);
-	SET(vL, v.x - 1, v.y);
-	SET(vR, v.x + 1, v.y);
-	#undef SET
-	v = (vU + vD + vL + vR + B * alpha) * (1.0f / beta);
-	return v;
-}
+		Un.a1 = N.r;
+		Un.a2 = N.r*N.u;
+		Un.a3 = N.r*N.v;
+		Un.a4 = (calcE(N.T, N.r, Con) + (N.u*N.u+N.v*N.v)/2)*N.r;
 
-__global__ void Viscosity(Particle* newField, Particle* oldField, float dt, Config Con){
-	int x = blockIdx.x * blockDim.x + threadIdx.x+1;
-	int y = blockIdx.y * blockDim.y + threadIdx.y+1;
-	int index = y*FIELDWIDTH + x;
+		En.a1 = Un.a2;
+		En.a2 = Un.a2*N.u + N.p - TauXX;
+		En.a3 = Un.a2*N.v - TauXY;
+		En.a4 = (Un.a4 + N.p)*N.v - N.u*TauXX - N.v*TauXY + qx;
 
-	Vec2 pos = { x * 1.0f, y * 1.0f };
-	Vec2 u = oldField[index].u;
-	float alpha = Con.nu * Con.nu / dt;
-	float beta = 4.0f + alpha;
-	newField[index].u = JacobiVel(oldField, pos, u, alpha, beta);
-}
+		Fn.a1 = Un.a3;
+		Fn.a2 = En.a3;
+		Fn.a3 = Un.a3*N.v + N.p - N.u*TauYY;
+		Fn.a4 = (Un.a4 + N.p)*N.v - N.u*TauXY - N.v*TauYY + qy;
 
-void Diffusion(dim3 numBlocks, dim3 numThreads, float dt, Config Con){
-	for(int i = 0; i<50; i++){
-		Viscosity<<<numBlocks, numThreads>>>(PartFieldNew, PartFieldOld, dt, Con);
-		diffuseDue<<<numBlocks, numThreads>>>(PartFieldNew, PartFieldOld, dt, Con);
-
-		std::swap(PartFieldNew, PartFieldOld);
+		U[index] = Un;
+		E[index] = En;
+		F[index] = Fn;
 	}
 }
 
-__device__ float JacobiPress(float* Field, Vec2 pos, float B, float alpha, float beta){
-	float C = Field[int(pos.y) * FIELDWIDTH + int(pos.x)];
-	float xU = C, xD = C, xL = C, xR = C;
-	#define SET(P, x, y) if (x < FIELDWIDTH && x >= 0 && y < FIELDHEIGHT && y >= 0) P = Field[int(y) * FIELDWIDTH + int(x)]
-	SET(xU, pos.x, pos.y - 1);
-	SET(xD, pos.x, pos.y + 1);
-	SET(xL, pos.x - 1, pos.y);
-	SET(xR, pos.x + 1, pos.y);
-	#undef SET
-	float pressure = (xU + xD + xL + xR + alpha * B) * (1.0f / beta);
-	return pressure;
-}
-
-
-__device__ float divergency(Particle* field, Vec2 pos){
-	float x = pos.x;
-	float y = pos.y;
-	Particle& C = field[int(y)*FIELDWIDTH+int(x)];
-	float x1=-1*C.u.x, x2 = -1*C.u.x, y1 = -1*C.u.y, y2 = -1*C.u.y;
-	#define SET(P,x,y) if (x < FIELDWIDTH && x >= 0 && y < FIELDHEIGHT && y >= 0) P = field[int(y) * FIELDWIDTH + int(x)]
-	SET(x1,x+1,y).u.x;
-	SET(x2,x-1,y).u.x;
-	SET(y1,x,y+1).u.y;
-	SET(x2,x,y-1).u.y;
-	#undef SET
-	return (x1-x2+y1-y2)*0.5f;
-}
-
-
-__global__ void CompPressure(Particle* field, float* newField, float* oldField, float dt, Config Con){
+__global__ void calc_field(Vec5 *fieldOld, Vec5 *fieldNew, Vec4 *E, Vec4 *F, Vec4 *U, Config Con, float dt, Vec2 force, Vec2 ForcePoint, float ForceRadius){
 	int x = blockIdx.x * blockDim.x + threadIdx.x+1;
 	int y = blockIdx.y * blockDim.y + threadIdx.y+1;
 	int index = y*FIELDWIDTH + x;
+	if((x<FIELDHEIGHT) && (y<FIELDHEIGHT)){
+		Vec4 Force;
+		Vec4 Visc;
 
-	Vec2 pos = { x * 1.0f, y * 1.0f };
-	float div = divergency(field, pos)+0.000001f;
-	//printf("%f", div);
-	float press = oldField[index];
-	float alpha = -1.0;
-	float beta = 4.0f;
-	newField[index] = JacobiPress(oldField, pos, div, alpha, beta);
-}
+		if((x-ForcePoint.x)*(x-ForcePoint.x)+(y-ForcePoint.y)*(y-ForcePoint.y) <= ForceRadius){
+			Force.a1 = 0;
+			Force.a2 = fieldOld[index].r * force.x * dt;
+			Force.a3 = fieldOld[index].r * force.y * dt;
+			Force.a4 = 0;
+		}else{
+			Force.a1 = 0;
+			Force.a2 = 0;
+			Force.a3 = 0;
+			Force.a4 = 0;
+		}
 
-void computePressure(dim3 numBlocks, dim3 threadsPerBlock, float dt)
-{
-	for (int i = 0; i < 50; i++)	{
-		CompPressure<<<numBlocks, threadsPerBlock>>>(PartFieldOld, PressureFieldNew, PressureFieldOld, dt, config);
-		std::swap(PressureFieldOld, PressureFieldNew);
+		Visc.a1 = 0;
+		Visc.a2 = ((fieldOld[takeIndex(x+1,y)].u - 2*fieldOld[index].u + fieldOld[takeIndex(x-1,y)].u) + (fieldOld[takeIndex(x,y+1)].u - 2*fieldOld[index].u + fieldOld[takeIndex(x,y-1)].u)) / (Con.dx*Con.dx);
+		Visc.a3 = ((fieldOld[takeIndex(x+1,y)].v - 2*fieldOld[index].v + fieldOld[takeIndex(x-1,y)].v) + (fieldOld[takeIndex(x,y+1)].v - 2*fieldOld[index].v + fieldOld[takeIndex(x,y-1)].v)) / (Con.dx*Con.dx);
+		Visc.a4 = 0;
+
+		Vec4 Rec = ((E[takeIndex(x-1,y)] - E[takeIndex(x+1,y)]) + (F[takeIndex(x,y-1)]-F[takeIndex(x,y+1)])) * dt/(2*Con.dx) + Force + Visc * Con.nu * dt * fieldOld[index].r;
+		Vec5 New;
+
+		New.r = Rec.a1;
+		New.u = Rec.a2 / Rec.a1;
+		New.v = Rec.a3 / Rec.a1;
+		float e = Rec.a4/ Rec.a1 - (New.u*New.u+ New.v*New.v)/2;
+		New.p = calcP(Rec.a1, e, Con);
+		New.T = calcT(Rec.a1, e, Con);
+
+		fieldNew[index] = fieldOld[index] - New;
 	}
 }
 
-__device__ Vec2 gradient(float* field, int x, int y){
-	float C = field[y * FIELDWIDTH + x];
-	#define SET(P, x, y) if (x < FIELDWIDTH && x >= 0 && y < FIELDHEIGHT && y >= 0) P = field[int(y) * FIELDWIDTH + int(x)]
-	float x1 = C, x2 = C, y1 = C, y2 = C;
-	SET(x1, x + 1, y);
-	SET(x2, x - 1, y);
-	SET(y1, x, y + 1);
-	SET(y2, x, y - 1);
-	#undef SET
-	Vec2 res = { (x1 - x2) * 0.5f, (y1 - y2) * 0.5f };
-	return res;
-}
-
-__global__ void project(Particle* newField, float* pField, float dt)
-{
-	int x = blockIdx.x * blockDim.x + threadIdx.x+1;
-	int y = blockIdx.y * blockDim.y + threadIdx.y+1;
-	Vec2& u = newField[y * FIELDWIDTH + x].u;
-	u = u - gradient(pField, x, y);
-}
-
-__global__ void initField(float StartPress, float StartTemp, float StartRo, Particle* PartField, float* PressureField){
+__global__ void initField(float StartPress, float StartTemp, float StartRo, Vec5 *field){
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	int index = y*FIELDWIDTH + x;
 
 	if((x<=FIELDHEIGHT) && (y<=FIELDHEIGHT)){
 		//if(((x == 0)||(x == FIELDHEIGHT - 1))&&((y == 0)||(y == FIELDWIDTH - 1))){
-			PartField[index].u.x = 0;
-			PartField[index].u.y = 0;
-			PartField[index].due = 0;
-			PressureField[index] = 100;
+			field[index].p = StartPress;
+			field[index].T = StartTemp;
+			field[index].r = StartRo;
+			field[index].u = 0.00004*index;
+			field[index].v = 0.00004*index;
 		//}
-	}
-	if(x==10 && y==10){
-		printf("%f \n", PressureField[index]);
 	}
 }
 
-__global__ void bord_cond(Particle *PartField, float *PressureField, Config Con){
+__global__ void bord_cond(Vec5 *field, float *dye, Config Con){
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	int index = y*FIELDWIDTH + x;
 
 	if(x == 0 && y < FIELDHEIGHT && y > 0){
-		int takeInd = takeIndex(x+1, y);
-		PartField[index].u.x = -PartField[takeInd].u.x;
-		PartField[index].u.y = PartField[takeInd].u.y;
-		PartField[index].due = PartField[takeInd].due;
-		PressureField[index] = PressureField[takeInd];
-		//PressureField[index] = 0.1;
+		field[index].p = field[takeIndex(x+1,y)].p;
+		field[index].T = field[takeIndex(x+1,y)].T;
+		field[index].r = field[takeIndex(x+1,y)].r;
+		field[index].u = -field[takeIndex(x+1,y)].u;
+		field[index].v = field[takeIndex(x+1,y)].v;
+		dye[index] = dye[takeIndex(x+1,y)];
 	}
 
 	if(x == FIELDWIDTH-1 && y < FIELDHEIGHT && y > 0){
-		int takeInd = takeIndex(x-1, y);
-		//PartField[index].u.x = -PartField[takeInd].u.x;
-		PartField[index].u.y = PartField[takeInd].u.y;
-		PartField[index].due = PartField[takeInd].due;
-		PressureField[index] = PressureField[takeInd];
+		field[index].p = field[takeIndex(x-1,y)].p;
+		field[index].T = field[takeIndex(x-1,y)].T;
+		field[index].r = field[takeIndex(x-1,y)].r;
+		field[index].u = -field[takeIndex(x-1,y)].u;
+		field[index].v = field[takeIndex(x-1,y)].v;
+		dye[index] = dye[takeIndex(x-1,y)];
 	}
 
 	if(y == 0 && x < FIELDWIDTH && x > 0){
-		int takeInd = takeIndex(x,y+1);
-		PartField[index].u.x = PartField[takeInd].u.x;
-		PartField[index].u.y = -PartField[takeInd].u.y;
-		PartField[index].due = PartField[takeInd].due;
-		PressureField[index] = PressureField[takeInd];
+		field[index].p = field[takeIndex(x,y+1)].p;
+		field[index].T = field[takeIndex(x,y+1)].T;
+		field[index].r = field[takeIndex(x,y+1)].r;
+		field[index].u = field[takeIndex(x,y+1)].u;
+		field[index].v = -field[takeIndex(x,y+1)].v;
+		dye[index] = dye[takeIndex(x,y+1)];
 	}
 
 	if(y == FIELDHEIGHT-1 && x < FIELDWIDTH && x > 0){
-		int takeInd = takeIndex(x,y-1);
-		PartField[index].u.x = PartField[takeInd].u.x;
-		PartField[index].u.y = -PartField[takeInd].u.y;
-		PartField[index].due = PartField[takeInd].due;
-		PressureField[index] = PressureField[takeInd];
+		field[index].p = field[takeIndex(x,y-1)].p;
+		field[index].T = field[takeIndex(x,y-1)].T;
+		field[index].r = field[takeIndex(x,y-1)].r;
+		field[index].u = field[takeIndex(x,y-1)].u;
+		field[index].v = -field[takeIndex(x,y-1)].v;
+		dye[index] = dye[takeIndex(x,y-1)];
 	}
+
+	field[index].p = Con.P;
+	field[index].T = Con.T;
+	field[index].r = Con.ro;
+
 }
 
 void init_cuda(){
@@ -418,84 +336,133 @@ void init_cuda(){
     int FieldWidth = FIELDWIDTH;
     int FieldHeight = FIELDHEIGHT;
 
-	cudaMalloc((void**)&PartFieldNew, FieldWidth*FieldHeight*sizeof(Particle));
-	cudaMalloc((void**)&PartFieldOld, FieldWidth*FieldHeight*sizeof(Particle));
-	cudaMalloc((void**)&PressureFieldNew, FieldWidth*FieldHeight*sizeof(Particle));
-	cudaMalloc((void**)&PressureFieldOld, FieldWidth*FieldHeight*sizeof(Particle));
-	cudaMalloc((void**)&dueHost, 4*FieldWidth*FieldHeight*sizeof(uint8_t));
+	cudaMalloc((void**)&devVec5FieldOld, FieldHeight*FieldWidth*sizeof(Vec5));
+	cudaMalloc((void**)&devVec5FieldNew, FieldHeight*FieldWidth*sizeof(Vec5));
+	cudaMalloc((void**)&EVec4Field, FieldHeight*FieldWidth*sizeof(Vec4));
+	cudaMalloc((void**)&FVec4Field, FieldHeight*FieldWidth*sizeof(Vec4));
+	cudaMalloc((void**)&UVec4Field, FieldHeight*FieldWidth*sizeof(Vec4)); 
+	cudaMalloc((void**)&ColorField, 4*FieldHeight*FieldWidth*sizeof(uint8_t)); 
+	cudaMalloc((void**)&dye, FieldHeight*FieldWidth*sizeof(float)); 
 
-	//dueHost = (uint8_t*)malloc(4*FIELDHEIGHT*FIELDWIDTH*sizeof(uint8_t));
+	EmptyVec5Field = (Vec5*)malloc(FieldHeight*FieldWidth*sizeof(Vec5));
+	//result = (Vec5*)malloc(FieldHeight*FieldWidth*sizeof(Vec5));
+
+	cudaMemset(&devVec5FieldNew, 0, FieldHeight*FieldWidth*sizeof(Vec5));
+	cudaMemset(&devVec5FieldOld, 0, FieldHeight*FieldWidth*sizeof(Vec5));
+	cudaMemset(&EVec4Field, 0, FieldHeight*FieldWidth*sizeof(Vec4));
+	cudaMemset(&FVec4Field, 0, FieldHeight*FieldWidth*sizeof(Vec4));
+	cudaMemset(&UVec4Field, 0, FieldHeight*FieldWidth*sizeof(Vec4));
+	cudaMemset(&dye, 0, FieldHeight*FieldWidth*sizeof(float));
+
+
+	// копируем ввод на device
+
+	//cudaMemcpy( devVec5Field, EmptyVec5Field, FieldHeight*FieldWidth*sizeof(Vec5), cudaMemcpyHostToDevice);
+	//cudaMemcpy( devVec5Field2, EmptyVec5Field, FieldHeight*FieldWidth*sizeof(Vec5), cudaMemcpyHostToDevice);
+
+	//calc_field<<<1,60>>>(devVec5FieldNew);
+
+	//cudaMemcpy(result, devVec5FieldNew, FieldHeight*FieldWidth*sizeof(Vec5), cudaMemcpyDeviceToHost);
+	//std::cout<<result[0].x<<" "<<result[1].x<<std::endl;
+	//cudaMemcpy(result, devVec5Field2, FieldHeight*FieldWidth*sizeof(Vec5), cudaMemcpyDeviceToHost);
+	//std::cout<<result[0].x<<" "<<result[1].x<<std::endl;
+	//free(result);
 
 	dim3 blocks((FIELDWIDTH)/THREDS_PER_BLOCK+1, (FIELDHEIGHT)/THREDS_PER_BLOCK+1);
 	dim3 threds(THREDS_PER_BLOCK,THREDS_PER_BLOCK);
-	initField<<<blocks, threds>>>(config.P, config.T, config.ro, PartFieldNew, PressureFieldNew);
-	initField<<<blocks, threds>>>(config.P, config.T, config.ro, PartFieldOld, PressureFieldOld);
+	initField<<<blocks, threds>>>(config.P, config.T, config.ro, devVec5FieldOld);
+	initField<<<blocks, threds>>>(config.P, config.T, config.ro, devVec5FieldNew);
 }
 
-__global__ void PaintImage(float *field, Particle* PartField, uint8_t *res){
+__global__ void calc_dye(Vec5 *field, float *dye, Vec2 Point, float dt, float Radius, Config Con){
+	int x = blockIdx.x * blockDim.x + threadIdx.x+1;
+	int y = blockIdx.y * blockDim.y + threadIdx.y+1;
+	int index = y*FIELDWIDTH + x;
+
+	if((x<FIELDHEIGHT) && (y<FIELDHEIGHT)){
+		float ddx = field[takeIndex(x-1,y)].u - field[takeIndex(x+1,y)].u;
+		float ddy = field[takeIndex(x,y-1)].v - field[takeIndex(x,y+1)].v;
+
+		float ddiffx = ((dye[takeIndex(x+1,y)] - 2*dye[index] + dye[takeIndex(x-1,y)]) + (dye[takeIndex(x,y+1)] - 2*dye[index] + dye[takeIndex(x,y-1)])) / (Con.dx*Con.dx);
+		float ddiffy = ((dye[takeIndex(x+1,y)] - 2*dye[index] + dye[takeIndex(x-1,y)]) + (dye[takeIndex(x,y+1)] - 2*dye[index] + dye[takeIndex(x,y-1)])) / (Con.dx*Con.dx);
+
+		float S = 0;
+
+		if((x-Point.x)*(x-Point.x)+(y-Point.y)*(y-Point.y) <= Radius){
+			S = Con.S;
+		}
+
+		dye[index] = ((ddx+ddy) * dye[index] + Con.DiffCoef*(ddiffx+ddiffy) + S)*dt;
+	}
+}
+
+__global__ void PaintImage(float *field, uint8_t *res){
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	int index = y*FIELDWIDTH + x;
-	if((x<=FIELDHEIGHT) && (y<=FIELDHEIGHT)){
-		res[4 * index+0] = int(PartField[index].u.x/1000);
-		//res[4 * index+0] = field[index];
-		res[4 * index+1] = 0;
-		res[4 * index+2] = 0;
-		res[4 * index+3] = 255;
-	}
-
-	if(x==100 && y==10){
-		//printf("%f \n", PartField[index].u.x);
+	if((x<FIELDHEIGHT) && (y<FIELDHEIGHT)){
+		//if(field[index].u != 0 || field[index].v != 0){
+			res[4 * index+0] = field[index];
+			res[4 * index+1] = 0;
+			res[4 * index+2] = 0;
+			res[4 * index+3] = 255;
+		//}else{
+		//	res[4 * index+0] = 0;
+		//	res[4 * index+1] = 0;
+		//	res[4 * index+2] = 0;
+		//	res[4 * index+3] = 255;
+		//}
 	}
 }
 
-//__global__ void print(float *field, int x, int y){
-//	printf("%f \n", field[y*FIELDWIDTH + x]);
-//}
-
-__global__ void print(Particle *field, int x, int y){
-	printf("%f \n", field[y*FIELDWIDTH + x].u.x);
+__global__ void print(Vec5 *field, int x, int y){
+	printf("%f \n", field[y*FIELDWIDTH + x].u);
 }
 
 void RenderImage(uint8_t* result, float dt, Vec2 force, Vec2 ForcePoint, float ForceRadius){
-	//print<<<1,1>>>(devVec5FieldNew, 0, 1);
+	print<<<1,1>>>(devVec5FieldNew, 0, 1);
 	//ForcePoint.x  = 1;
 	//ForcePoint.y  = 1;
-	print<<<1,1>>>(PartFieldOld, ForcePoint.x, ForcePoint.y);
+
 
 	dim3 blocks_calc((FIELDWIDTH-2)/THREDS_PER_BLOCK+1, (FIELDHEIGHT-2)/THREDS_PER_BLOCK+1);
 	dim3 blocks_rend((FIELDWIDTH)/(THREDS_PER_BLOCK)+1, (FIELDHEIGHT)/(THREDS_PER_BLOCK)+1);
 	dim3 threds_calc(THREDS_PER_BLOCK,THREDS_PER_BLOCK);
 	dim3 threds_rend(THREDS_PER_BLOCK,THREDS_PER_BLOCK);
 
-	//float* chek;
-	//chek = (float*)malloc(FIELDHEIGHT*FIELDWIDTH*sizeof(float));
+	float* chek;
+	chek = (float*)malloc(FIELDHEIGHT*FIELDWIDTH*sizeof(float));
 
-	bord_cond<<<blocks_rend, threds_rend>>>(PartFieldOld, PressureFieldOld, config);
+	pre_calc_field<<<blocks_calc, threds_calc>>>(devVec5FieldOld, devVec5FieldNew, EVec4Field, FVec4Field, UVec4Field, config);
+	calc_field<<<blocks_calc, threds_calc>>>(devVec5FieldOld, devVec5FieldNew, EVec4Field, FVec4Field, UVec4Field, config, dt, force, ForcePoint, ForceRadius);
+	
+	calc_dye<<<blocks_rend, threds_rend>>>(devVec5FieldNew, dye, ForcePoint, dt, ForceRadius, config);
 
-	Diffusion(blocks_calc, threds_calc, dt, config);
+	bord_cond<<<blocks_rend, threds_rend>>>(devVec5FieldNew, dye, config);
 
-	computePressure(blocks_calc, threds_calc, dt);
+	PaintImage<<<blocks_rend, threds_rend>>>(dye, ColorField);
 
-	// project
-	project<<<blocks_calc, threds_calc>>>(PartFieldOld, PressureFieldOld, dt);
-	cudaMemset(PressureFieldOld, 0, FIELDHEIGHT*FIELDWIDTH*sizeof(float));
+	//cudaMemcpy(chek, dye, FIELDHEIGHT*FIELDWIDTH*sizeof(float), cudaMemcpyDeviceToHost);
+	//std::cout<<chek[1000]<<std::endl;
 
-	// advect
-	advect<<<blocks_calc, threds_calc>>>(PartFieldNew, PartFieldOld, dt, config);
-	std::swap(PartFieldNew, PartFieldOld);
+	cudaMemcpy(EmptyVec5Field, devVec5FieldNew, FIELDHEIGHT*FIELDWIDTH*sizeof(Vec5), cudaMemcpyDeviceToHost);
+	//std::cout<<EmptyVec5Field[1000].p<<" "<<EmptyVec5Field[1001].p<<std::endl;
+	//std::cout<<dye[1000]<<" "<<dye[1001]<<std::endl;
 
-	PaintImage<<<blocks_rend, threds_rend>>>(PressureFieldOld, PartFieldOld, dueHost);
+	
 
-	cudaMemcpy(result, dueHost, 4*FIELDHEIGHT*FIELDWIDTH*sizeof(uint8_t), cudaMemcpyDeviceToHost);
+	cudaMemcpy(result, ColorField, 4*FIELDHEIGHT*FIELDWIDTH*sizeof(uint8_t), cudaMemcpyDeviceToHost);
+
+	std::swap(devVec5FieldOld, devVec5FieldNew);
 }
 
 void Exit_cuda(){
-	free(PartFieldHost);
-	free(PressureFieldHost);
+	free(EmptyVec5Field);
 
-	cudaFree(PartFieldNew);
-	cudaFree(PartFieldOld);
-	cudaFree(PressureFieldNew);
-	cudaFree(PressureFieldOld);
+	cudaFree(devVec5FieldNew);
+	cudaFree(devVec5FieldOld);
+	cudaFree(EVec4Field);
+	cudaFree(FVec4Field);
+	cudaFree(UVec4Field);
+	cudaFree(ColorField);
 }
