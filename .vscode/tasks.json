@@ -1,0 +1,23 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "shell",
+			"label": "CUDA launch",
+			"command": "nvcc",
+			"args": [
+				"-g",
+				"${file}",
+				"-o",
+				"${fileDirname}/${fileBasenameNoExtension}",
+				"-I /usr/include/SFML",
+                "-lsfml-graphics",
+                "-lsfml-window",
+                "-lsfml-system",
+			],
+			"options": {
+				"cwd": "${fileDirname}"
+			},
+		}
+	]
+}
